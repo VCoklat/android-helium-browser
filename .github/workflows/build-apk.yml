@@ -1,0 +1,76 @@
+# Build Helium Browser APK Workflow
+#
+# Required Secrets:
+# - KEYSTORE_BASE64: Base64 encoded keystore file
+# - KEYSTORE_PASSWORD: Keystore password
+# - KEY_ALIAS: Key alias
+# - KEY_PASSWORD: Key password
+
+name: Build Helium Browser APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup signing keys
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # Create local.properties content and base64 encode for LOCAL_TEST_JKS
+          LOCAL_PROPS="storePassword=${KEYSTORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASSWORD}"
+          echo "LOCAL_TEST_JKS=$(echo "${LOCAL_PROPS}" | base64 -w 0)" >> "$GITHUB_ENV"
+          # Set STORE_TEST_JKS from KEYSTORE_BASE64
+          echo "STORE_TEST_JKS=${KEYSTORE_BASE64}" >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: |
+          chmod +x build.sh
+          chmod +x common.sh
+
+      - name: Run build script
+        run: ./build.sh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helium-browser-apk
+          path: chromium/src/out/Default/apks/**/*.apk
+
+      - name: Create Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}
+          files: chromium/src/out/Default/apks/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
