@@ -19,6 +19,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write
 
     steps:
       - name: Free up disk space
@@ -69,6 +71,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ github.run_number }}
-          files: chromium/src/out/Default/apks/**/*.apk
+          files: chromium/src/out/Default/apks/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
