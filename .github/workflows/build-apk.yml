@@ -23,19 +23,50 @@ jobs:
       contents: write
 
     steps:
-      - name: Free up disk space
+      - name: Maximize disk space
         run: |
+          echo "=== Initial disk space ==="
+          df -h
+          
+          # Remove unnecessary large packages
+          sudo apt-get remove -y '^dotnet-.*' || true
+          sudo apt-get remove -y 'php.*' || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          
+          # Remove large directories
           sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
           sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/microsoft
+          sudo rm -rf /opt/az
+          sudo rm -rf /opt/pipx
+          sudo rm -rf /imagegeneration
+          
+          # Remove Docker images
+          sudo docker image prune --all --force || true
+          
+          # Remove swap to free more space (optional, may slow build)
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          
+          echo "=== Disk space after cleanup ==="
+          df -h
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1  # Shallow clone to save space
 
       - name: Setup signing keys
         env:
@@ -58,7 +89,14 @@ jobs:
           chmod +x common.sh
 
       - name: Run build script
-        run: ./build.sh
+        run: |
+          # Monitor disk space during build
+          (while true; do df -h / | tail -1; sleep 300; done) &
+          MONITOR_PID=$!
+          
+          ./build.sh
+          
+          kill $MONITOR_PID 2>/dev/null || true
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
