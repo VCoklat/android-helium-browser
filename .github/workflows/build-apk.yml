@@ -40,8 +40,9 @@ jobs:
       version: ${{ steps.version.outputs.VERSION }}
     
     steps:
+      # Only run disk cleanup on GitHub-hosted runners (not self-hosted)
       - name: Maximize disk space
-        if: ${{ !contains(github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted', 'self-hosted') }}
+        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           echo "=== Initial disk space ==="
           df -h
@@ -183,8 +184,9 @@ jobs:
       actions: write
     
     steps:
+      # Only run disk cleanup on GitHub-hosted runners (not self-hosted)
       - name: Maximize disk space
-        if: ${{ !contains(github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted', 'self-hosted') }}
+        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/graalvm
@@ -207,7 +209,6 @@ jobs:
 
       - name: Configure sccache for Chromium
         run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           echo "CC_WRAPPER=sccache" >> $GITHUB_ENV
           echo "CXX_WRAPPER=sccache" >> $GITHUB_ENV
           
