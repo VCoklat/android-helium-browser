@@ -21,10 +21,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner to use (self-hosted recommended for full builds)'
+        description: 'Runner to use (ubuntu-latest or self-hosted)'
         required: true
         type: string
-        default: 'self-hosted'
+        default: 'ubuntu-latest'
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -32,7 +32,7 @@ env:
 jobs:
   # Job 1: Setup - Prepare source code and dependencies
   setup:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -177,7 +177,7 @@ jobs:
   # Job 2: Build - Compile with sccache caching
   build:
     needs: setup
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 300
     permissions:
       contents: read
