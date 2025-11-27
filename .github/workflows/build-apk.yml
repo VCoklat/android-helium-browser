@@ -1,5 +1,10 @@
 # Build Helium Browser APK Workflow
 #
+# This workflow uses a multi-job approach to build Chromium-based Helium Browser:
+# - Job 1 (setup): Prepares source code and dependencies, uploads as artifact
+# - Job 2 (build): Downloads source, builds with sccache caching, uploads APK
+# - Job 3 (release): Creates GitHub release from build artifacts
+#
 # Required Secrets:
 # - KEYSTORE_BASE64: Base64 encoded keystore file
 # - KEYSTORE_PASSWORD: Keystore password
@@ -14,16 +19,30 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner to use (ubuntu-latest or self-hosted)'
+        required: true
+        type: string
+        default: 'ubuntu-latest'
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+  # Job 1: Setup - Prepare source code and dependencies
+  setup:
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 120
     permissions:
-      contents: write
-
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    
     steps:
+      # Only run disk cleanup on GitHub-hosted runners (not self-hosted)
       - name: Maximize disk space
+        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           echo "=== Initial disk space ==="
           df -h
@@ -55,7 +74,7 @@ jobs:
           # Remove Docker images
           sudo docker image prune --all --force || true
           
-          # Remove swap to free more space (optional, may slow build)
+          # Remove swap to free more space
           sudo swapoff -a || true
           sudo rm -f /swapfile || true
           
@@ -66,7 +85,207 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1  # Shallow clone to save space
+          fetch-depth: 1
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected Chromium version: $VERSION"
+
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt update
+          sudo apt install -y sudo lsb-release file nano git curl python3 python3-pillow
+
+      - name: Setup depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch Chromium source
+        run: |
+          export PATH="$PWD/depot_tools:$PATH"
+          export VERSION=${{ steps.version.outputs.VERSION }}
+          export CHROMIUM_SOURCE=https://github.com/chromium/chromium.git
+          
+          mkdir -p chromium/src/out/Default
+          cd chromium/src
+          git init
+          git remote add origin $CHROMIUM_SOURCE
+          git fetch --depth 2 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
+          git checkout $VERSION
+          export COMMIT=$(git show-ref -s $VERSION | head -n1)
+          
+          cat > ../.gclient <<EOF
+          solutions = [
+            {
+              "name": "src",
+              "url": "$CHROMIUM_SOURCE@$COMMIT",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "checkout_android_prebuilts_build_tools": True,
+                "checkout_telemetry_dependencies": False,
+                "codesearch": "Debug",
+              },
+            },
+          ]
+          target_os = ["android"]
+          EOF
+          
+          git submodule foreach git config -f ./.git/config submodule.$name.ignore all
+          git config --add remote.origin.fetch '+refs/tags/*:refs/tags/*'
+
+      - name: Apply patches
+        run: |
+          export PATH="$PWD/depot_tools:$PATH"
+          cd chromium/src
+          
+          # Replace Vanadium with Helium in patches
+          find "$GITHUB_WORKSPACE/vanadium/patches" -type f -exec sed -i 's@VANADIUM@HELIUM@g' {} \;
+          find "$GITHUB_WORKSPACE/vanadium/patches" -type f -exec sed -i 's@Vanadium@Helium@g' {} \;
+          find "$GITHUB_WORKSPACE/vanadium/patches" -type f -exec sed -i 's@vanadium@helium@g' {} \;
+          
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch
+
+      - name: Sync dependencies
+        run: |
+          export PATH="$PWD/depot_tools:$PATH"
+          cd chromium/src
+          gclient sync -D --no-history --nohooks
+          gclient runhooks
+          rm -rf third_party/angle/third_party/VK-GL-CTS/
+
+      - name: Install build dependencies
+        run: |
+          cd chromium/src
+          ./build/install-build-deps.sh --no-prompt
+
+      - name: Upload prepared source
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-source-${{ steps.version.outputs.VERSION }}
+          path: |
+            chromium/
+            depot_tools/
+          retention-days: 1
+          compression-level: 1
+
+  # Job 2: Build - Compile with sccache caching
+  build:
+    needs: setup
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: write
+    
+    steps:
+      # Only run disk cleanup on GitHub-hosted runners (not self-hosted)
+      - name: Maximize disk space
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/graalvm
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: chromium-source-${{ needs.setup.outputs.version }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Configure sccache for Chromium
+        run: |
+          echo "CC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "CXX_WRAPPER=sccache" >> $GITHUB_ENV
+          
+          # Configure sccache settings
+          mkdir -p ~/.config/sccache
+          cat > ~/.config/sccache/config <<EOF
+          [cache.gha]
+          enabled = true
+          EOF
+
+      - name: Generate build configuration
+        run: |
+          export PATH="$PWD/depot_tools:$PATH"
+          cd chromium/src
+          
+          cat > out/Default/args.gn <<EOF
+          chrome_public_manifest_package = "io.github.jqssun.helium"
+          is_desktop_android = true
+          target_os = "android"
+          target_cpu = "arm64"
+          is_component_build = false
+          is_debug = false
+          is_official_build = true
+          symbol_level = 1
+          disable_fieldtrial_testing_config = true
+          ffmpeg_branding = "Chrome"
+          proprietary_codecs = true
+          enable_vr = false
+          enable_arcore = false
+          enable_openxr = false
+          enable_cardboard = false
+          enable_remoting = false
+          enable_reporting = false
+          google_api_key = "x"
+          google_default_client_id = "x"
+          google_default_client_secret = "x"
+          
+          blink_symbol_level=1
+          build_contextual_search=false
+          build_with_tflite_lib=true
+          chrome_pgo_phase=0
+          dcheck_always_on=false
+          enable_hangout_services_extension=false
+          enable_iterator_debugging=false
+          enable_mdns=false
+          exclude_unwind_tables=false
+          icu_use_data_file=true
+          rtc_build_examples=false
+          use_debug_fission=true
+          use_errorprone_java_compiler=false
+          use_official_google_api_keys=false
+          use_rtti=false
+          enable_av1_decoder=true
+          enable_dav1d_decoder=true
+          include_both_v8_snapshots = false
+          include_both_v8_snapshots_android_secondary_abi = false
+          generate_linker_map = true
+          
+          # Enable sccache/ccache
+          cc_wrapper = "sccache"
+          EOF
+          
+          gn gen out/Default
+
+      - name: Build Chrome APK
+        run: |
+          export PATH="$PWD/depot_tools:$PATH"
+          cd chromium/src
+          
+          # Show sccache stats before build
+          sccache --show-stats || true
+          
+          # Build with ninja
+          autoninja -C out/Default chrome_public_apk
+          
+          # Show sccache stats after build
+          sccache --show-stats || true
 
       - name: Setup signing keys
         env:
@@ -75,28 +294,30 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          chmod +x common.sh
+          source common.sh
+          
           # Create local.properties content and base64 encode for LOCAL_TEST_JKS
           LOCAL_PROPS="storePassword=${KEYSTORE_PASSWORD}
           keyAlias=${KEY_ALIAS}
           keyPassword=${KEY_PASSWORD}"
-          echo "LOCAL_TEST_JKS=$(echo "${LOCAL_PROPS}" | base64 -w 0)" >> "$GITHUB_ENV"
-          # Set STORE_TEST_JKS from KEYSTORE_BASE64
-          echo "STORE_TEST_JKS=${KEYSTORE_BASE64}" >> "$GITHUB_ENV"
-
-      - name: Make scripts executable
-        run: |
-          chmod +x build.sh
-          chmod +x common.sh
-
-      - name: Run build script
-        run: |
-          # Monitor disk space during build
-          (while true; do df -h / | tail -1; sleep 300; done) &
-          MONITOR_PID=$!
+          export LOCAL_TEST_JKS=$(echo "${LOCAL_PROPS}" | base64 -w 0)
+          export STORE_TEST_JKS="${KEYSTORE_BASE64}"
           
-          ./build.sh
+          set_keys
+
+      - name: Sign APK
+        run: |
+          cd chromium/src
+          export PATH=$PWD/third_party/jdk/current/bin/:$PATH
+          export ANDROID_HOME=$PWD/third_party/android_sdk/public
+          export VERSION=${{ needs.setup.outputs.version }}
           
-          kill $MONITOR_PID 2>/dev/null || true
+          chmod +x $GITHUB_WORKSPACE/common.sh
+          source $GITHUB_WORKSPACE/common.sh
+          
+          mkdir -p out/Default/apks/release
+          sign_apk $(find out/Default/apks -name 'Chrome*.apk') out/Default/apks/release/$VERSION.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -104,11 +325,33 @@ jobs:
           name: helium-browser-apk
           path: chromium/src/out/Default/apks/**/*.apk
 
-      - name: Create Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ github.run_number }}
-          files: chromium/src/out/Default/apks/release/*.apk
+          name: helium-browser-signed-${{ needs.setup.outputs.version }}
+          path: chromium/src/out/Default/apks/release/*.apk
+
+  # Job 3: Release - Create GitHub release
+  release:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download signed APK
+        uses: actions/download-artifact@v4
+        with:
+          name: helium-browser-signed-${{ needs.setup.outputs.version }}
+          path: release-apks/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.setup.outputs.version }}
+          name: Helium Browser v${{ needs.setup.outputs.version }}
+          files: release-apks/*.apk
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
