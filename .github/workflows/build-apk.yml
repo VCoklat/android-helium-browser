@@ -144,6 +144,10 @@ jobs:
           export PATH="$PWD/depot_tools:$PATH"
           cd chromium/src
           
+          # Configure git identity for applying patches
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          
           # Replace Vanadium with Helium in patches
           find "$GITHUB_WORKSPACE/vanadium/patches" -type f -exec sed -i 's@VANADIUM@HELIUM@g' {} \;
           find "$GITHUB_WORKSPACE/vanadium/patches" -type f -exec sed -i 's@Vanadium@Helium@g' {} \;
